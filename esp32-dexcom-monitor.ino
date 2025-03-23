@@ -1,5 +1,5 @@
 // #define OTA_ENABLE
-// #define SERVER_ENABLE
+#define SERVER_ENABLE
 #define DEXCOM_ENABLE
 
 #include <WiFi.h>
@@ -16,12 +16,14 @@
 #include <ESPmDNS.h>
 #include <time.h>
 #include <Preferences.h>
-#include "secrets.h"
+
 
 Preferences preferences;  // Create an NVS storage object
 
 const char* dexcom_server = "https://shareous1.dexcom.com/ShareWebServices/Services/";
 const float MMOL_CON = 0.0555;
+const String MMOL_UNIT = "mmol/L";
+const String MG_UNIT = "mg/dL";
 int glucoseValue = 0;
 char* glucoseTrend = "";
 String glucoseTime = "";
@@ -83,7 +85,7 @@ void loop() {
     fetchGlucoseFlag = false;  // Reset flag
     getGlucoseReading();       // Fetch new glucose value
     if (glucoseValue > 0) {
-      Serial.println(glucoseTime + " " + glucoseValue + " mg/dL " + String(glucoseValue * MMOL_CON) + " mmol/L " + glucoseTrend);
+      Serial.println(glucoseTime + " " + getGlucoseValue(glucoseValue) + " " + preferences.getString("dexcom_unit") + " " + glucoseTrend);
     }
   }
 
@@ -110,6 +112,7 @@ void setupWifi() {
   // Load stored Wi-Fi credentials
   String ssid = preferences.getString("ssid", "");
   String password = preferences.getString("wifi_password", "");
+  int errorCount = 0;
   // ******* Setup WIFI *********
   Serial.println();
   Serial.println(ssid);
@@ -118,14 +121,19 @@ void setupWifi() {
     WiFi.begin(ssid, password);
 
     while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
+      delay(1000);
       Serial.print(".");
+      ++errorCount;
+      // This means that having problems with logging in wifi, might want to re-enter credentaials
+      if (errorCount > 20) {
+        storeWiFiCredentials();
+      }
     }
     Serial.println("");
     Serial.println("WiFi connected, IP address: " + WiFi.localIP());
 
     // ******* Setup mDNS *********
-    String mDNS = preferences.getString("mDNS", "esp32");
+    String mDNS = preferences.getString("mdns", "esp32");
     if (MDNS.begin(mDNS)) {
       Serial.println(mDNS + " started");
     }
@@ -197,6 +205,10 @@ void readInput() {
 #ifdef DEXCOM_ENABLE
     else if (command.equalsIgnoreCase("SET DEXCOM")) {
       storeDexcomCredentials();
+    } else if (command.equalsIgnoreCase("SET DEXCOM CONFIG")) {
+      storeDexcomConfig();
+    } else if (command.equalsIgnoreCase("SHOW DEXCOM")){
+      showDexcomValue();
     }
 #endif
 #ifdef OTA_ENABLE
@@ -217,6 +229,8 @@ void showMenu() {
   Serial.println("SET WIFI - Sets Wifi credentials");
 #ifdef DEXCOM_ENABLE
   Serial.println("SET DEXCOM - Sets Dexcom credentials");
+  Serial.println("SET DEXCOM CONFIG - Set Dexcom units, high, low, ...");
+  Serial.println("SHOW DEXCOM - Shows Current values");
 #endif
 #ifdef OTA_ENABLE
   Serial.println("SET OTA - Sets the Over the air updates");
@@ -225,6 +239,8 @@ void showMenu() {
 }
 
 void storeWiFiCredentials() {
+  Serial.println("Enter mDNS Host:");
+  String mdns = readSerialInput();
   Serial.println("Enter Wi-Fi SSID:");
   String ssid = readSerialInput();
   Serial.println("Enter Wi-Fi Password:");
@@ -233,6 +249,7 @@ void storeWiFiCredentials() {
   if (ssid.length() > 0 && password.length() > 0) {
     preferences.putString("ssid", ssid);
     preferences.putString("wifi_password", password);
+    preferences.putString("mdns", mdns);
     Serial.println("Wi-Fi credentials saved!");
     setupWifi();
   } else {
@@ -256,6 +273,11 @@ void resetAllCredentials() {
     Serial.println("Deleting Over the air credentials");
     preferences.putString("ota_host", "");
     preferences.putString("ota_password", "");
+    Serial.println("Reseting Dexcom preferences to mmol, low (4), and high (10)");
+    preferences.putFloat("dexcom_high", 10);
+    preferences.putFloat("dexcom_low", 4);
+    preferences.putFloat("dexcom_coef", 1);
+    preferences.putString("dexcom_unit", MG_UNIT);
   } else {
     Serial.println("Credentials was NOT reset");
   }
@@ -328,29 +350,24 @@ char* getTrendArrow(String trend) {
 }
 
 void setDexcomStatus() {
-  float mmol_value = glucoseValue * MMOL_CON;
-  // high 14 and greater
-  if (mmol_value > 14) {
+  float high = preferences.getFloat("dexcom_high", 10);
+  float low = preferences.getFloat("dexcom_low", 4);
+  float glucose_value = getGlucoseValue(glucoseValue);
+  if (glucose_value > high) {
     ledBrightness = 5;
     interval = 1000;
-    iconColor = "yellow";
+    iconColor = "orange";
     flash_builtin();
-    // Rangeish 4.5 - 14
-  } else if (mmol_value > 4.5) {
+  } else if (glucose_value < low) {
+    interval = 100;
+    ledBrightness = 100;
+    iconColor = "red";
+    flash_builtin();
+  } else {
     interval = 5000;
     ledBrightness = 1;
     iconColor = "green";
     flash_builtin();
-    // Lowish
-  } else if (mmol_value > 3.8) {
-    interval = 500;
-    ledBrightness = 10;
-    iconColor = "orange";
-    flash_builtin();
-    // Low
-  } else if (mmol_value < 3.8) {
-    iconColor = "red";
-    analogWrite(led_builtin, 255);
   }
 }
 
@@ -370,6 +387,15 @@ void flash_builtin() {
 }
 
 #ifdef DEXCOM_ENABLE
+
+float getGlucoseValue(float value) {
+  return value * preferences.getFloat("dexcom_coef", 1);
+}
+
+void showDexcomValue() {
+  getGlucoseReading();
+  Serial.println(glucoseTime + " " + getGlucoseValue(glucoseValue) + " " + preferences.getString("dexcom_unit") + " " + glucoseTrend);
+}
 // Function to get Dexcom session ID
 bool setupDexcom() {
   String account_id = preferences.getString("dexcom_id", "");
@@ -445,6 +471,31 @@ void storeDexcomCredentials() {
     Serial.println("Invalid input. Dexcom credentials not saved.");
   }
 }
+
+void storeDexcomConfig() {
+  Serial.println("Choose Units  (1) for " + MMOL_UNIT + ", or enter for " + MG_UNIT);
+  String units = readSerialInput();
+  Serial.println("Choose High Alarm");
+  float high = readSerialInput().toFloat();
+  Serial.println("Choose Low Alarm");
+  float low = readSerialInput().toFloat();
+
+  if (units == "1") {
+    preferences.putString("dexcom_unit", MMOL_UNIT);
+    preferences.putFloat("dexcom_coef", MMOL_CON);
+    Serial.println("should be mmol");
+  } else {
+    preferences.putString("dexcom_unit", MG_UNIT);
+    preferences.putFloat("dexcom_coef", 1);
+    Serial.println("should be mg");
+  }
+  preferences.putFloat("dexcom_high", high);
+  preferences.putFloat("dexcom_low", low);
+
+
+  Serial.println("Units: " + preferences.getString("dexcom_unit") + " coef: " + String(preferences.getFloat("dexcom_coef"), 2));
+  Serial.println("High: " + String(preferences.getFloat("dexcom_high"), 2) + " Low: " + String(preferences.getFloat("dexcom_low"), 2));
+}
 #endif
 
 
@@ -458,6 +509,10 @@ void handleRoot() {
   int min = (sec / 60) % 60;
   sec = sec % 60;
 
+  char reading[50];  // Allocate enough space for the formatted string
+  sprintf(reading, "%.2f %s %s", getGlucoseValue(glucoseValue), preferences.getString("dexcom_unit", "ERR"), glucoseTrend);
+
+
   snprintf(
     temp, 1000,
     "<html>\
@@ -466,7 +521,7 @@ void handleRoot() {
     <meta charset='UTF-8'>\
     <link rel='icon' type='image/x-icon' href='/favicon.ico'> \
     <link rel='mask-icon' href='/favicon.ico'> \
-    <title>%.2f mmol %s</title>\
+    <title>%s</title>\
     <style>\
       body { \
         background-color: #dddddd; \
@@ -485,13 +540,12 @@ void handleRoot() {
   <body>\
     <main>\
     <div class='glucose-data'>\
-      <span> %s </span>\
-      %.2f mmol <span>%s</span> <p>%s</p>\
+    %s %s<p>%s</p>\
     </div> \
     </main> \
   </body>\
   </html>",
-    (glucoseValue * MMOL_CON), glucoseTrend, generateFaviconSVG().c_str(), (glucoseValue * MMOL_CON), glucoseTrend, glucoseTime.c_str());
+    reading, generateFaviconSVG().c_str(), reading, glucoseTime.c_str());
   server.send(200, "text/html", temp);
 }
 
